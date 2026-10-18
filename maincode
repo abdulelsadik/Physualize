@@ -1,0 +1,1681 @@
+#!/usr/bin/env python3
+"""
+Physualize v2 – Physics Visualization Engine
+Dark Tkinter UI • Multiple simulation models • Smarter offline parser
+Multi-stage problems: e.g. "a spring launches a block up a ramp" is split into
+stages that run one after another, each drawn in its own panel, with the speed
+and mass at the end of one stage carried into the next.
+Optional: attached PNG/GIF diagrams are read by a vision model:
+  • Ollama (default, free, local): install from https://ollama.com, then
+    `ollama pull qwen2.5vl:7b`. No account or key needed; works offline.
+  • Claude (online): `pip install anthropic` + the ANTHROPIC_API_KEY environment variable.
+Without either, everything still works offline from the typed text.
+"""
+
+import tkinter as tk
+from tkinter import messagebox, filedialog
+import base64
+import copy
+import json
+import math
+import os
+import queue
+import re
+import sys
+import tempfile
+import threading
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Any, Tuple
+
+# ─── Theme ───────────────────────────────────────────────────────────────────
+BG     = '#0b1230'
+PANEL  = '#141f33'
+TEXT   = '#edf4ff'
+MINT   = '#68e5c0'
+BLUE   = '#86b7ff'
+MUTED  = '#9aacc5'
+ACCENT = '#263955'
+CANVAS = '#102238'
+
+# ─── Data structures ─────────────────────────────────────────────────────────
+@dataclass
+class ParsedProblem:
+    model: str = 'none'          # spring, freefall, projectile, pendulum, incline, track, collision, circular, motion
+    mass: Optional[float] = None
+    height: Optional[float] = None
+    speed: Optional[float] = None
+    velocity: Optional[float] = None
+    amplitude: Optional[float] = None
+    vmax: Optional[float] = None
+    angle: Optional[float] = None       # degrees
+    length: Optional[float] = None      # pendulum / incline length
+    period: Optional[float] = None
+    k: Optional[float] = None           # spring constant
+    mu: Optional[float] = None          # friction coefficient
+    radius: Optional[float] = None
+    h_target: Optional[float] = None    # second height (track problems)
+    mass2: Optional[float] = None       # second body (collisions)
+    speed2: Optional[float] = None
+    direction: Optional[str] = None     # 'up' / 'down' along an incline
+    chain: str = 'solo'                 # solo, or first / middle / last stage of a multi-stage problem
+    g: float = 9.81
+    notes: List[str] = field(default_factory=list)
+    raw: str = ''
+
+# Keyword patterns per model, in priority order. "hits the ground" is not a collision.
+COLLISION_RX = (r'\bcollision|\bcollide|\bcrash|\bstrikes?\b|\bmomentum|\bimpact\s+with'
+                r'|\bhits?\b(?!\s+the\s+(?:ground|floor|water|bottom))')
+STAGE_PATTERNS = [
+    ('spring',     r'\bspring|\bharmonic|\boscillat|\bshm\b'),
+    ('pendulum',   r'\bpendulum|\bswing|\bbob\b'),
+    ('collision',  COLLISION_RX),
+    ('circular',   r'\bcircular|\bcentripetal|\borbit'),
+    ('track',      r'\bsnowboard|\bskier|\bpeak|\bvalley|\btrack\b|\bfrictionless path|\broller ?coaster'),
+    ('projectile', r'\bprojectile|\blaunched at|\bprojected|\bthrown at|\bkicked at'),
+    ('incline',    r'\bincline|\bramp|\bslope|\bwedge'),
+    ('freefall',   r'\bfree ?fall|\bfalls?\b|\bfalling|\bdrops?\b|\bdropped'),
+]
+# Clause boundaries: sentence ends, commas, "and", "then", "after which", "before", "until"
+CLAUSE_SPLIT_RX = (r'(?<=[.;!?])\s+|,\s+|\s+(?:and\s+)?then\s+|\s+and\s+(?=[a-z])'
+                   r'|\s+after which\s+|\s+before\s+|\s+until\s+')
+MAX_STAGES = 4
+# Inside one clause, a new stage starts at the motion verb before the next model's keyword
+# ("…compressed 0.2 m goes up a ramp").
+MOTION_VERB_RX = (r'\b(?:goes|go|slides?|moves?|travels?|rolls?|lands?|enters?|falls?|swings?|leaves?'
+                  r'|continues?|climbs?|flies|is (?:launched|fired|released))\b')
+# Keyword pairs that describe one situation, not two stages (skier on a slope, car on a circular track…)
+SAME_STAGE_PAIRS = {frozenset(p) for p in [('track', 'incline'), ('circular', 'track'),
+                                           ('projectile', 'freefall')]}
+MODEL_PRIORITY = [m for m, _ in STAGE_PATTERNS]
+
+# ─── Offline Parser ──────────────────────────────────────────────────────────
+class OfflineParser:
+    """Extract quantities and detect physics model from natural language."""
+
+    def __init__(self, g: float = 9.81):
+        self.g = g
+
+    def _num(self, pattern: str, text: str) -> Optional[float]:
+        m = re.search(pattern, text, re.I)
+        return float(m.group(1)) if m else None
+
+    def _has(self, text: str, *keywords) -> bool:
+        return any(re.search(rf'\b{re.escape(k)}', text, re.I) for k in keywords)
+
+    def parse(self, text: str) -> ParsedProblem:
+        text = text.strip()
+        p = ParsedProblem(raw=text, g=self.g)
+
+        # ── quantities ──────────────────────────────────────────────────────
+        M = r'm\b(?!\s*/)'   # metres, but not the 'm' of 'm/s'
+        p.mass = self._num(r'(\d+(?:\.\d+)?)\s*kg\b', text)
+        p.height = (
+            self._num(rf'(?:height|altitude|from a height)\s*(?:of|=|:)?\s*(\d+(?:\.\d+)?)\s*{M}', text)
+            or self._num(rf'(?:drops?|falls?|dropped|fallen)\s*(?:from\s*)?(\d+(?:\.\d+)?)\s*{M}', text)
+            or self._num(r'(\d+(?:\.\d+)?)\s*m\s*(?:high|tall|drop|fall)\b', text)
+        )
+        p.vmax = self._num(r'(?:maximum\s+speed|max(?:imum)?\s+velocity|vmax)\s*(?:of|is|=|:)?\s*(\d+(?:\.\d+)?)\s*m\s*/\s*s', text)
+        p.speed = (
+            self._num(r'(?:speed|velocity)\s*(?:of|is|=|:)?\s*(\d+(?:\.\d+)?)\s*m\s*/\s*s', text)
+            or self._num(r'(\d+(?:\.\d+)?)\s*m\s*/\s*s', text)   # any bare "25 m/s"
+        )
+        p.velocity = p.speed
+        p.amplitude = (
+            self._num(rf'(?:amplitude\s*(?:of|=|:)?\s*|compress(?:ed|es|ing)?(?:\s+(?:it|the spring))?\s*(?:by\s*)?|compression\s*(?:of\s*)?|stretch(?:ed|es|ing)?(?:\s+(?:it|the spring))?\s*(?:by\s*)?)(\d+(?:\.\d+)?)\s*{M}', text)
+        )
+        p.angle = self._num(r'(\d+(?:\.\d+)?)\s*(?:°|deg(?:rees)?\b)', text)
+        if p.angle is None:
+            p.angle = self._num(r'angle\s*(?:of|=|:)?\s*(\d+(?:\.\d+)?)', text)
+        p.length = (
+            self._num(rf'(?:length|string|cord|rope|pendulum)\s*(?:of|=|:)?\s*(\d+(?:\.\d+)?)\s*{M}', text)
+            or self._num(r'(\d+(?:\.\d+)?)\s*m\s*(?:long|length|string|pendulum)\b', text)
+        )
+        p.k = self._num(r'(?:spring\s+constant|\bk)\s*(?:of|=|:)?\s*(\d+(?:\.\d+)?)\s*N\s*/\s*m', text)
+        p.mu = self._num(r'(?:\bfriction|μ|\bmu\b)\s*(?:coefficient\s*)?(?:of|=|:)?\s*(\d+(?:\.\d+)?)', text)
+        p.radius = self._num(rf'(?:radius|\br)\s*(?:of|=|:)?\s*(\d+(?:\.\d+)?)\s*{M}', text)
+        p.period = self._num(r'(?:period|\bT)\s*(?:of|=|:)?\s*(\d+(?:\.\d+)?)\s*s\b', text)
+
+        # fallback height if context suggests drop/fall
+        if p.height is None and self._has(text, 'fall', 'drop', 'slope', 'skier', 'snowboard', 'height', 'cliff', 'peak'):
+            p.height = self._num(rf'(\d+(?:\.\d+)?)\s*{M}', text)
+
+        if re.search(r'\b(?:up|ascend\w*|climb\w*)\b', text, re.I):
+            p.direction = 'up'
+        elif re.search(r'\b(?:down|descend\w*)\b', text, re.I):
+            p.direction = 'down'
+
+        # from rest (only if no initial speed was stated)
+        if p.speed is None and self._has(text, 'from rest', 'at rest', 'starts from rest'):
+            p.speed = 0.0
+            p.velocity = 0.0
+
+        # ── model detection (priority order) ────────────────────────────────
+        if self._has(text, 'spring', 'harmonic', 'oscillat', 'shm') or p.amplitude is not None and p.k is not None:
+            p.model = 'spring'
+        elif self._has(text, 'pendulum', 'swinging', 'bob'):
+            p.model = 'pendulum'
+        elif re.search(COLLISION_RX, text, re.I):
+            p.model = 'collision'
+        elif self._has(text, 'circular', 'centripetal', 'uniform circular', 'orbit') or (p.radius is not None and p.speed is not None):
+            p.model = 'circular'
+        elif self._has(text, 'snowboarder', 'skier', 'peak', 'valley', 'track', 'frictionless path'):
+            p.model = 'track'
+        elif self._has(text, 'projectile', 'launched', 'projected', 'thrown at', 'kicked at') or \
+             (p.angle is not None and p.speed is not None and p.angle > 5 and not self._has(text, 'incline', 'slope', 'ramp')):
+            p.model = 'projectile'
+        elif self._has(text, 'incline', 'inclined', 'slope', 'ramp', 'wedge') or \
+             (p.angle is not None and self._has(text, 'plane', 'surface', 'friction')):
+            p.model = 'incline'
+        elif p.height is not None or self._has(text, 'fall', 'drop', 'free fall', 'freefall'):
+            p.model = 'freefall'
+        elif p.speed is not None or p.velocity is not None:
+            p.model = 'motion'
+        else:
+            p.model = 'none'
+            p.notes.append('Could not identify a supported physics model.')
+
+        return p
+
+    def split_stages(self, text: str) -> List[Tuple[str, str]]:
+        """Split a problem into (model, text) stages in the order they happen.
+        Clauses without a model keyword stay with the stage before them."""
+        stages: List[List] = []
+        pending: List[str] = []
+        clauses = [part for c in re.split(CLAUSE_SPLIT_RX, text.strip()) if c and c.strip()
+                   for part in self._split_clause(c.strip())]
+        for clause in clauses:
+            model = next((m for m, rx in STAGE_PATTERNS if re.search(rx, clause, re.I)), None)
+            if model is None:
+                (stages[-1][1] if stages else pending).append(clause)
+            elif stages and stages[-1][0] == model:
+                stages[-1][1].append(clause)
+            else:
+                stages.append([model, pending + [clause]])
+                pending = []
+        merged: List[List] = []           # fold "skier … slope"-type neighbours into one stage
+        for model, cs in stages:
+            if merged and frozenset((merged[-1][0], model)) in SAME_STAGE_PAIRS:
+                merged[-1][0] = min(merged[-1][0], model, key=MODEL_PRIORITY.index)
+                merged[-1][1] += cs
+            elif merged and merged[-1][0] == model:
+                merged[-1][1] += cs
+            else:
+                merged.append([model, cs])
+        return [(m, ' '.join(cs)) for m, cs in merged][:MAX_STAGES]
+
+    def _split_clause(self, clause: str) -> List[str]:
+        hits = sorted((mm.start(), model) for model, rx in STAGE_PATTERNS
+                      for mm in re.finditer(rx, clause, re.I))
+        parts, start, cur, cur_end = [], 0, None, 0
+        for pos, model in hits:
+            if cur is None or model == cur or frozenset((cur, model)) in SAME_STAGE_PAIRS:
+                cur, cur_end = cur or model, max(cur_end, pos)
+                continue
+            verbs = [v.start() for v in re.finditer(MOTION_VERB_RX, clause[cur_end:pos], re.I)]
+            if not verbs:
+                cur_end = max(cur_end, pos)
+                continue                      # no verb between them: same situation
+            cut = cur_end + verbs[-1]
+            parts.append(clause[start:cut].strip())
+            start, cur, cur_end = cut, model, pos
+        parts.append(clause[start:].strip())
+        return [p for p in parts if p]
+
+    def parse_problem(self, text: str) -> List[ParsedProblem]:
+        """One ParsedProblem per stage; a single-model problem gives a list of one."""
+        stages = self.split_stages(text)
+        if len(stages) <= 1:
+            return [self.parse(text)]
+        whole = self.parse(text)
+        out = []
+        for model, stage_text in stages:
+            p = self.parse(stage_text)
+            p.model = model
+            p.notes = []
+            out.append(p)
+        if out[0].mass is None:
+            out[0].mass = whole.mass
+        return out
+
+# ─── Diagram reader: local Ollama model or Claude (both optional) ───────────
+VISION_MODEL = 'claude-opus-5-5'
+MODELS = ['spring', 'freefall', 'projectile', 'pendulum', 'incline', 'track',
+          'collision', 'circular', 'motion', 'none']
+QUANTITIES = ['mass', 'mass2', 'height', 'h_target', 'speed', 'speed2', 'amplitude', 'vmax',
+              'angle', 'length', 'period', 'k', 'mu', 'radius']
+
+VISION_SYSTEM = """You read physics problems (a diagram image plus optional typed text) and extract \
+the quantities a simple simulator needs.
+
+Pick the single best model:
+- track: energy conservation along a hill/valley path (snowboarder, skier, roller coaster)
+- freefall: object dropped or falling vertically
+- projectile: launched at an angle
+- incline: block on a ramp/slope
+- spring: mass on a spring / simple harmonic motion
+- pendulum: bob on a string
+- circular: uniform circular motion
+- collision: two bodies colliding
+- motion: constant-velocity motion
+- none: none of the above
+
+If the problem has several phases one after another (e.g. a spring launches a block, which then \
+slides up a ramp; a pendulum bob swings down and hits a block), return one stage per phase, in order \
+(at most 4). Otherwise return a single stage.
+
+Rules:
+- Convert everything to SI: kg, m, m/s, s, N/m. Angles in degrees: from the horizontal for \
+projectile and incline, from the vertical for pendulum.
+- Read values from labels, arrows and annotations in the diagram as well as from the text. \
+When text and diagram disagree, prefer the text.
+- track: height = start height, h_target = height of the second point of interest.
+- collision: mass/speed = body 1, mass2/speed2 = body 2; speeds are magnitudes (body 2 moves toward body 1).
+- "from rest" means speed = 0.
+- In a later stage, leave speed null when it comes from the previous stage; give mass only if a \
+new body is introduced (for a collision stage, put the body being hit in mass2/speed2).
+- direction: "up" or "down" for an incline stage (which way the object moves along it), else null.
+- description: a short sentence describing that stage.
+- Use null for anything not given. Do not invent values.
+- problem_text: a one-paragraph restatement of the whole problem including the diagram's values.
+- notes: anything ambiguous or assumed, in one short sentence (empty string if none)."""
+
+STAGE_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'model': {'type': 'string', 'enum': MODELS},
+        **{q: {'type': ['number', 'null']} for q in QUANTITIES},
+        'direction': {'anyOf': [{'type': 'string', 'enum': ['up', 'down']}, {'type': 'null'}]},
+        'description': {'type': 'string'},
+    },
+    'required': ['model', *QUANTITIES, 'direction', 'description'],
+    'additionalProperties': False,
+}
+VISION_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'stages': {'type': 'array', 'items': STAGE_SCHEMA},
+        'problem_text': {'type': 'string'},
+        'notes': {'type': 'string'},
+    },
+    'required': ['stages', 'problem_text', 'notes'],
+    'additionalProperties': False,
+}
+
+
+def pip_command(upgrade: bool = True) -> str:
+    """pip command for exactly the Python running this app (others may be on PATH)."""
+    exe = f'"{sys.executable}"' if ' ' in sys.executable else sys.executable
+    return f'{exe} -m pip install {"--upgrade " if upgrade else ""}anthropic'
+
+
+class VisionError(Exception):
+    """Readable failure message shown to the user; the app then falls back to offline parsing."""
+
+
+ENGINES = {   # key -> label in the UI
+    'ollama': 'Ollama (local, free)',
+    'claude': 'Claude (online, API key)',
+    'off': 'Off (typed text only)',
+}
+OLLAMA_DEFAULT_MODEL = os.environ.get('PHYSUALIZE_OLLAMA_MODEL', 'qwen2.5vl:7b')
+# Model families on ollama.com that can read images (used if the chosen model isn't downloaded)
+OLLAMA_VISION_FAMILIES = ('qwen2.5vl', 'qwen3-vl', 'gemma3', 'llama3.2-vision', 'llama4', 'llava',
+                          'llava-llama3', 'minicpm-v', 'granite3.2-vision', 'mistral-small3.1', 'moondream')
+OLLAMA_TIMEOUT = 600   # s; the first request loads the model into memory, which is slow on CPU-only PCs
+JSON_ONLY_HINT = ('\n\nReply with only a JSON object (no prose, no code fences) '
+                  'that matches this JSON schema:\n' + json.dumps(VISION_SCHEMA))
+
+
+def ollama_host() -> str:
+    host = os.environ.get('OLLAMA_HOST', '').strip() or 'http://localhost:11434'
+    if '://' not in host:
+        host = 'http://' + host
+    host = host.replace('://0.0.0.0', '://localhost').rstrip('/')
+    if host.count(':') == 1:
+        host += ':11434'
+    return host
+
+
+def load_image_bytes(path: str, engine: str) -> Tuple[bytes, str]:
+    """Read the diagram. Must run on the Tk thread: GIFs are converted to PNG for Ollama with Tk."""
+    with open(path, 'rb') as fh:
+        data = fh.read()
+    if data.startswith(b'\x89PNG'):
+        media_type = 'image/png'
+    elif data[:6] in (b'GIF87a', b'GIF89a'):
+        media_type = 'image/gif'
+    else:
+        raise VisionError('Only PNG and GIF images are supported.')
+    if media_type == 'image/gif' and engine == 'ollama':   # local models reliably read PNG/JPEG only
+        fd, tmp = tempfile.mkstemp(suffix='.png')
+        os.close(fd)
+        try:
+            tk.PhotoImage(file=path).write(tmp, format='png')
+            with open(tmp, 'rb') as fh:
+                data, media_type = fh.read(), 'image/png'
+        finally:
+            os.remove(tmp)
+    if len(data) > VisionInterpreter.MAX_BYTES:
+        raise VisionError('Image is larger than 5 MB; please use a smaller file.')
+    return data, media_type
+
+
+class VisionInterpreter:
+    """Sends an attached diagram (+ typed text) to a vision model and returns one ParsedProblem per stage."""
+
+    MAX_BYTES = 5 * 1024 * 1024
+
+    def __init__(self):
+        self.who = ''               # e.g. "Ollama (qwen2.5vl:7b)" — shown in the status bar
+        self.notes: List[str] = []
+
+    def interpret(self, data: bytes, media_type: str, text: str, g: float,
+                  engine: str = 'ollama', ollama_model: str = '') -> List[ParsedProblem]:
+        self.notes = []
+        user_text = f'Typed problem text:\n{text}' if text else 'No typed text; use the diagram only.'
+        if engine == 'claude':
+            raw_json = self._ask_claude(data, media_type, user_text)
+        else:
+            raw_json = self._ask_ollama(data, user_text, ollama_model)
+        try:   # local models / plain-JSON mode can wrap the object in prose or ``` fences
+            out = json.loads(raw_json[raw_json.find('{'):raw_json.rfind('}') + 1])
+        except (json.JSONDecodeError, ValueError):
+            raise VisionError(f'{self.who} returned an unreadable answer. Try again.')
+        if not isinstance(out, dict):
+            raise VisionError(f'{self.who} returned an unreadable answer. Try again.')
+
+        stages = []
+        for st in (out.get('stages') or [])[:MAX_STAGES]:
+            if not isinstance(st, dict):
+                continue
+            model = st.get('model') if st.get('model') in MODELS else 'none'
+            p = ParsedProblem(model=model, g=g)
+            for q in QUANTITIES:
+                v = st.get(q)
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
+                    setattr(p, q, float(v))
+            p.velocity = p.speed
+            p.direction = st.get('direction') if st.get('direction') in ('up', 'down') else None
+            p.raw = str(st.get('description') or '')
+            stages.append(p)
+        if not stages:
+            raise VisionError(f'{self.who} did not find a physics problem in the image.')
+        if len(stages) == 1:   # single model: give the sim the full wording too
+            stages[0].raw = '\n'.join(x for x in (text, str(out.get('problem_text') or '')) if x)
+        if out.get('notes'):
+            stages[0].notes.append(str(out['notes']))
+        stages[0].notes += self.notes
+        return stages
+
+    # ── Ollama (local) ───────────────────────────────────────────────────────
+    def _ask_ollama(self, data: bytes, user_text: str, wanted: str) -> str:
+        host = ollama_host()
+        try:
+            with urllib.request.urlopen(host + '/api/tags', timeout=5) as r:
+                installed = [m.get('name', '') for m in json.load(r).get('models', [])]
+        except (urllib.error.URLError, OSError, ValueError):
+            raise VisionError(f"Ollama isn't running (looked at {host}).\n\n"
+                              'Install it from https://ollama.com and start it, then download a vision model:\n'
+                              f'    ollama pull {OLLAMA_DEFAULT_MODEL}')
+
+        model = (wanted or OLLAMA_DEFAULT_MODEL).strip()
+        if model not in installed and f'{model}:latest' not in installed:
+            vision = [n for n in installed if n.split(':')[0].split('/')[-1] in OLLAMA_VISION_FAMILIES]
+            if not vision:
+                raise VisionError(f'The vision model "{model}" is not downloaded yet. In a terminal, run:\n'
+                                  f'    ollama pull {model}')
+            self.notes.append(f'"{model}" is not downloaded, so {vision[0]} was used instead.')
+            model = vision[0]
+        self.who = f'Ollama ({model})'
+
+        body = {
+            'model': model,
+            'stream': False,
+            'format': VISION_SCHEMA,                 # structured output (Ollama 0.5+)
+            'options': {'temperature': 0},
+            'messages': [
+                {'role': 'system', 'content': VISION_SYSTEM + JSON_ONLY_HINT},
+                {'role': 'user', 'content': user_text,
+                 'images': [base64.standard_b64encode(data).decode('ascii')]},
+            ],
+        }
+        try:
+            reply = self._ollama_chat(host, body)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode('utf-8', 'replace')
+            if 'image' in detail.lower() or 'vision' in detail.lower():
+                raise VisionError(f'"{model}" cannot read images. Use a vision model, for example:\n'
+                                  f'    ollama pull {OLLAMA_DEFAULT_MODEL}')
+            body['format'] = 'json'                  # older Ollama without JSON-schema support
+            try:
+                reply = self._ollama_chat(host, body)
+            except urllib.error.HTTPError as e2:
+                raise VisionError(f'Ollama error ({e2.code}): {e2.read().decode("utf-8", "replace")[:300]}')
+        content = (reply.get('message') or {}).get('content', '')
+        if not content:
+            raise VisionError(f'{self.who} returned an empty answer. Try again.')
+        return content
+
+    @staticmethod
+    def _ollama_chat(host: str, body: dict) -> dict:
+        req = urllib.request.Request(host + '/api/chat', data=json.dumps(body).encode('utf-8'),
+                                     headers={'Content-Type': 'application/json'})
+        try:
+            with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as r:
+                return json.load(r)
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise VisionError(f'Ollama stopped responding ({e}). Is it still running?')
+
+    # ── Claude (online) ──────────────────────────────────────────────────────
+    def _ask_claude(self, data: bytes, media_type: str, user_text: str) -> str:
+        self.who = 'Claude'
+        try:
+            import anthropic
+        except ImportError:
+            raise VisionError('The anthropic package is not installed for the Python running Physualize:\n'
+                              f'{sys.executable}\n\nRun:  {pip_command()}')
+        self.sdk_version = getattr(anthropic, '__version__', '?')
+        self.compat_mode = False
+
+        content = [
+            {'type': 'image', 'source': {'type': 'base64', 'media_type': media_type,
+                                         'data': base64.standard_b64encode(data).decode('ascii')}},
+            {'type': 'text', 'text': user_text},
+        ]
+        request = dict(
+            model=VISION_MODEL,
+            max_tokens=16000,
+            system=VISION_SYSTEM,
+            messages=[{'role': 'user', 'content': content}],
+            output_config={'effort': 'medium',
+                           'format': {'type': 'json_schema', 'schema': VISION_SCHEMA}},
+        )
+        try:
+            client = anthropic.Anthropic()
+            response = self._send(client, request)
+        except anthropic.AuthenticationError:
+            raise VisionError('Claude rejected the API key. Check ANTHROPIC_API_KEY.')
+        except anthropic.PermissionDeniedError:
+            raise VisionError('This API key is not allowed to use the model.')
+        except anthropic.RateLimitError:
+            raise VisionError('Rate limited by the Claude API. Wait a moment and try again.')
+        except anthropic.BadRequestError as e:
+            raise VisionError(f'The Claude API rejected the request: {e.message}')
+        except anthropic.APIStatusError as e:
+            raise VisionError(f'Claude API error ({e.status_code}). Try again later.')
+        except anthropic.APIConnectionError:
+            raise VisionError('Could not reach the Claude API. Check your internet connection.')
+        except anthropic.AnthropicError as e:   # e.g. no API key configured at all
+            raise VisionError(f'Claude is not configured: {e}\n'
+                              'Set the ANTHROPIC_API_KEY environment variable.')
+
+        if response.stop_reason == 'refusal':
+            raise VisionError('Claude declined to interpret this image.')
+        if response.stop_reason == 'max_tokens':
+            raise VisionError('Claude\'s answer was cut off. Try again.')
+        if self.compat_mode:
+            self.notes.append(f'Your anthropic package ({self.sdk_version}) is old, so a compatibility mode '
+                              f'was used. Upgrade with: {pip_command()}')
+        return next((b.text for b in response.content if b.type == 'text'), '')
+
+    def _send(self, client, request: dict):
+        """Use the newest API features the installed SDK supports. Older SDK versions reject
+        unknown parameters with TypeError (or lack client.beta), so step down one level at a time."""
+        try:
+            # Server-side fallback: if a safety classifier declines, the API retries on another model.
+            return client.beta.messages.create(
+                betas=['server-side-fallback-2026-07-01'], fallbacks='default', **request)
+        except (TypeError, AttributeError):
+            pass
+        try:
+            return client.messages.create(**request)            # structured outputs, no fallback
+        except TypeError:
+            pass
+        # Old SDK without structured outputs: ask for the JSON in the prompt instead.
+        self.compat_mode = True
+        plain = {k: v for k, v in request.items() if k != 'output_config'}
+        plain['system'] = request['system'] + JSON_ONLY_HINT
+        return client.messages.create(**plain)
+
+
+def merge_stages(primary: List[ParsedProblem], fallback: List[ParsedProblem]) -> List[ParsedProblem]:
+    """Fill gaps in Claude's stages from the offline parse when both found the same stages."""
+    if len(primary) == len(fallback):
+        for p, f in zip(primary, fallback):
+            merge_parsed(p, f)
+    return primary
+
+
+def merge_parsed(primary: ParsedProblem, fallback: ParsedProblem) -> ParsedProblem:
+    """Fill quantities Claude left empty with whatever the offline parser found."""
+    for q in QUANTITIES + ['velocity', 'direction']:
+        if getattr(primary, q) is None and getattr(fallback, q) is not None:
+            setattr(primary, q, getattr(fallback, q))
+    if primary.model == 'none':
+        primary.model = fallback.model
+    return primary
+
+
+# ─── Simulation engines ──────────────────────────────────────────────────────
+class BaseSim:
+    def __init__(self, parsed: ParsedProblem):
+        self.p = parsed
+        self.t = 0.0
+        self.dt = 0.016
+        self.finished = False
+        self.results: List[str] = []
+        self.equations: List[str] = []
+        self.exit_speed = 0.0                       # speed handed to the next stage
+        self.carried_mass: Optional[float] = None   # body that moves on to the next stage
+        self._setup()
+        if self.carried_mass is None:
+            self.carried_mass = self.p.mass
+
+    def _setup(self):
+        pass
+
+    def step(self) -> bool:
+        """Advance one frame. Return True if still running."""
+        return False
+
+    def state(self) -> Dict[str, Any]:
+        return {}
+
+    def reset(self):
+        self.t = 0.0
+        self.finished = False
+        self._setup()
+
+
+class FreeFallSim(BaseSim):
+    def _setup(self):
+        self.h0 = self.p.height or 10.0
+        self.u = self.p.speed or 0.0
+        self.g = self.p.g
+        self.y = self.h0
+        self.v = self.u
+        self.vf = math.sqrt(self.u**2 + 2*self.g*self.h0)
+        self.T = (self.vf - self.u) / self.g if self.g > 0 else 0
+        self.exit_speed = self.vf
+        pe = (self.p.mass or 1) * self.g * self.h0 if self.p.mass else None
+        self.results = [f'Height: {self.h0:g} m']
+        if self.p.mass:
+            self.results.append(f'Mass: {self.p.mass:g} kg')
+            if pe is not None:
+                self.results.append(f'Potential energy: {pe:,.2f} J')
+        self.results.append(f'Impact speed: {self.vf:.2f} m/s ({self.vf*3.6:.1f} km/h)')
+        self.results.append(f'Time of flight: {self.T:.2f} s')
+        self.equations = [
+            f'v = √(u² + 2gh) = {self.vf:.2f} m/s',
+            f't = (v − u)/g = {self.T:.2f} s'
+        ]
+
+    def step(self):
+        if self.finished:
+            return False
+        self.v += self.g * self.dt
+        self.y -= self.v * self.dt
+        self.t += self.dt
+        if self.y <= 0:
+            self.y = 0
+            self.finished = True
+        return not self.finished
+
+    def state(self):
+        return {'y': self.y, 'v': self.v, 'h0': self.h0, 'progress': 1 - self.y/self.h0 if self.h0 else 1}
+
+
+class ProjectileSim(BaseSim):
+    def _setup(self):
+        self.u = self.p.speed or self.p.velocity or 20.0
+        self.angle = math.radians(self.p.angle if self.p.angle is not None else 45.0)
+        self.g = self.p.g
+        self.ux = self.u * math.cos(self.angle)
+        self.uy = self.u * math.sin(self.angle)
+        self.x = 0.0
+        self.y = 0.0
+        self.T = 2 * self.uy / self.g if self.g > 0 else 0
+        self.R = self.ux * self.T
+        self.H = (self.uy**2) / (2 * self.g) if self.g > 0 else 0
+        self.exit_speed = self.u   # lands at launch height with launch speed
+        self.results = [
+            f'Launch speed: {self.u:g} m/s',
+            f'Angle: {math.degrees(self.angle):.1f}°',
+            f'Max height: {self.H:.2f} m',
+            f'Range: {self.R:.2f} m',
+            f'Time of flight: {self.T:.2f} s'
+        ]
+        self.equations = [
+            f'H = (u² sin²θ)/(2g) = {self.H:.2f} m',
+            f'R = (u² sin 2θ)/g = {self.R:.2f} m'
+        ]
+
+    def step(self):
+        if self.finished:
+            return False
+        self.t += self.dt
+        self.x = self.ux * self.t
+        self.y = self.uy * self.t - 0.5 * self.g * self.t**2
+        if self.y < 0 and self.t > 0.05:
+            self.y = 0
+            self.finished = True
+        return not self.finished
+
+    def state(self):
+        return {'x': self.x, 'y': self.y, 'R': self.R, 'H': self.H, 't': self.t,
+                'ux': self.ux, 'uy': self.uy, 'g': self.g}
+
+
+class SpringSim(BaseSim):
+    """solo: oscillates forever. first stage: released from compression, the mass leaves at
+    equilibrium. later stage: the arriving mass compresses the spring and is pushed back out."""
+    def _setup(self):
+        self.m = self.p.mass or 0.5
+        self.g = self.p.g
+        self.mode = {'solo': 'oscillate', 'first': 'launch'}.get(self.p.chain, 'bounce')
+        A, k, vmax = self.p.amplitude, self.p.k, self.p.vmax
+        if k and vmax and not A:              # known spring, known arrival/launch speed
+            self.k = k
+            self.omega = math.sqrt(k / self.m)
+            self.A = vmax / self.omega
+        elif vmax and A:
+            self.A = A
+            self.omega = vmax / A
+            self.k = self.m * self.omega**2
+        elif k:
+            self.k = k
+            self.omega = math.sqrt(k / self.m)
+            self.A = A or 0.25
+        else:
+            self.A = A or 0.25
+            self.omega = 2 * math.pi
+            self.k = self.m * self.omega**2
+        self.period = 2 * math.pi / self.omega
+        self.x = {'oscillate': self.A, 'launch': -self.A, 'bounce': 0.0}[self.mode]
+        self.v = 0.0
+        self.exit_speed = self.A * self.omega
+        energy = 0.5 * self.k * self.A**2
+        self.results = [f'Amplitude: {self.A:.3g} m' if self.mode != 'bounce'
+                        else f'Max compression: {self.A:.3g} m']
+        if self.p.mass:
+            self.results.insert(0, f'Mass: {self.m:g} kg')
+        self.results += [
+            f'Spring constant k: {self.k:.3f} N/m',
+            f'ω: {self.omega:.3f} rad/s',
+            f'Period: {self.period:.3f} s',
+            f'Total energy: {energy:.4f} J'
+        ]
+        if self.mode == 'launch':
+            self.results.append(f'Launch speed: {self.exit_speed:.2f} m/s')
+        self.equations = [
+            f'ω = √(k/m) = {self.omega:.3f} rad/s',
+            f'T = 2π/ω = {self.period:.3f} s',
+            f'E = ½kA² = {energy:.4f} J'
+        ]
+        if self.mode != 'oscillate':
+            self.equations.append(f'v = Aω = {self.exit_speed:.2f} m/s')
+
+    def step(self):
+        if self.finished:
+            return False
+        self.t += self.dt
+        ph = self.omega * self.t
+        if self.mode == 'launch':        # compressed at -A, released, leaves at x = 0
+            if ph >= math.pi / 2:
+                ph, self.finished = math.pi / 2, True
+            self.x = -self.A * math.cos(ph)
+            self.v = self.A * self.omega * math.sin(ph)
+        elif self.mode == 'bounce':      # arrives at x = 0, compresses to -A, pushed back out
+            if ph >= math.pi:
+                ph, self.finished = math.pi, True
+            self.x = -self.A * math.sin(ph)
+            self.v = -self.A * self.omega * math.cos(ph)
+        else:
+            self.x = self.A * math.cos(ph)
+            self.v = -self.A * self.omega * math.sin(ph)
+        return not self.finished
+
+    def state(self):
+        return {'x': self.x, 'A': self.A, 'v': self.v}
+
+
+class PendulumSim(BaseSim):
+    """Released from an angle, or (in a later stage) started at the bottom with the arriving speed.
+    As the first/middle stage of a chain it stops when the bob passes the bottom."""
+    def _setup(self):
+        self.L = self.p.length or 1.0
+        self.g = self.p.g
+        self.period = 2 * math.pi * math.sqrt(self.L / self.g)
+        v_in = self.p.speed if self.p.chain in ('middle', 'last') else None
+        if v_in and self.p.angle is None:      # pushed from the bottom
+            self.theta0 = 0.0
+            self.theta = 0.0
+            self.omega = v_in / self.L
+            ratio = 1 - v_in**2 / (2 * self.g * self.L)
+            self.theta_max = math.acos(max(-1.0, ratio))
+            self.exit_speed = v_in
+            rise = v_in**2 / (2 * self.g)
+            self.results = [f'Length: {self.L:g} m', f'Speed at bottom: {v_in:.2f} m/s',
+                            f'Max angle: {math.degrees(self.theta_max):.1f}°'
+                            + (' (goes over the top)' if ratio < -1 else ''),
+                            f'Rise: {min(rise, 2 * self.L):.3f} m']
+            self.equations = [f'½mv² = mgL(1 − cosθ)  ⇒  θmax = {math.degrees(self.theta_max):.1f}°']
+        else:
+            self.theta0 = math.radians(self.p.angle if self.p.angle is not None else 30.0)
+            self.theta = self.theta0
+            self.omega = 0.0
+            self.exit_speed = math.sqrt(2 * self.g * self.L * (1 - math.cos(self.theta0)))
+            self.results = [
+                f'Length: {self.L:g} m',
+                f'Initial angle: {math.degrees(self.theta0):.1f}°',
+                f'Period (small-angle): {self.period:.3f} s',
+                f'Speed at bottom: {self.exit_speed:.2f} m/s',
+            ]
+            self.equations = [f'T ≈ 2π√(L/g) = {self.period:.3f} s',
+                              f'v = √[2gL(1 − cosθ)] = {self.exit_speed:.2f} m/s']
+        if self.p.mass:
+            self.results.insert(0, f'Mass: {self.p.mass:g} kg')
+
+    def step(self):
+        if self.finished:
+            return False
+        prev = self.theta
+        alpha = -(self.g / self.L) * math.sin(self.theta)
+        self.omega += alpha * self.dt
+        self.theta += self.omega * self.dt
+        self.t += self.dt
+        if self.p.chain in ('first', 'middle') and prev != 0 and prev * self.theta <= 0:
+            self.theta = 0.0          # passes the bottom: hand over to the next stage
+            self.finished = True
+        return not self.finished
+
+    def state(self):
+        return {'theta': self.theta, 'L': self.L, 'theta0': self.theta0}
+
+
+class InclineSim(BaseSim):
+    """Slides down from the top, or (direction 'up') moves up from the bottom and slows down."""
+    def _setup(self):
+        self.angle = math.radians(self.p.angle if self.p.angle is not None else 30.0)
+        sin_a, cos_a = math.sin(self.angle), math.cos(self.angle)
+        self.g = self.p.g
+        self.mu = self.p.mu or 0.0
+        self.up = self.p.direction == 'up'
+        self.s = 0.0
+        if self.up:
+            self.v = self.p.speed if self.p.speed else 5.0
+            decel = self.g * (sin_a + self.mu * cos_a)
+            d_stop = self.v**2 / (2 * decel) if decel > 0 else float('inf')
+            if self.p.height:
+                self.L = self.p.height / sin_a if sin_a > 1e-6 else self.p.height
+            else:
+                self.L = d_stop * 1.15 if math.isfinite(d_stop) else 10.0
+            self.travel = min(d_stop, self.L)
+            self.a = -decel
+            self.exit_speed = math.sqrt(max(self.v**2 - 2 * decel * self.L, 0.0)) if d_stop > self.L else 0.0
+            self.h = self.L * sin_a
+            self.results = [
+                f'Angle: {math.degrees(self.angle):.1f}°',
+                f'Speed at bottom: {self.v:.2f} m/s',
+                f'Deceleration: {decel:.2f} m/s²',
+                f'Distance up the ramp: {self.travel:.3f} m',
+                f'Height gained: {self.travel * sin_a:.3f} m',
+            ]
+            if d_stop > self.L:
+                self.results.append(f'Leaves the top at {self.exit_speed:.2f} m/s')
+            self.equations = [f'a = g(sinθ + μ cosθ) = {decel:.2f} m/s²',
+                              f'd = v²/(2a) = {d_stop:.3f} m']
+        else:
+            self.h = self.p.height or 5.0
+            self.L = self.h / sin_a if sin_a > 1e-6 else self.h
+            a = self.g * (sin_a - self.mu * cos_a)
+            self.a = max(a, 0.01)
+            self.v = self.p.speed or 0.0
+            self.exit_speed = math.sqrt(self.v**2 + 2 * self.a * self.L)
+            self.results = [
+                f'Angle: {math.degrees(self.angle):.1f}°',
+                f'Height: {self.h:g} m',
+                f'Incline length: {self.L:.2f} m',
+                f'Acceleration: {self.a:.2f} m/s²',
+                f'Speed at bottom: {self.exit_speed:.2f} m/s',
+            ]
+            self.equations = [f'a = g(sinθ − μ cosθ) = {self.a:.2f} m/s²']
+        if self.mu:
+            self.results.append(f'Friction μ: {self.mu:g}')
+
+    def step(self):
+        if self.finished:
+            return False
+        self.v += self.a * self.dt
+        self.s += self.v * self.dt
+        self.t += self.dt
+        if self.up and self.v <= 0:
+            self.v = 0.0
+            self.finished = True
+        if self.s >= self.L:
+            self.s = self.L
+            self.finished = True
+        return not self.finished
+
+    def state(self):
+        return {'s': self.s, 'L': self.L, 'angle': self.angle, 'v': self.v, 'h': self.h, 'up': self.up}
+
+
+class TrackSim(BaseSim):
+    """Simulates conservation of energy along a valley / track with peaks (snowboarder problem)."""
+    def _setup(self):
+        self.m = self.p.mass or 57.0
+        self.h0 = self.p.height or 45.0
+        self.h_target = 25.0
+        nums = re.findall(r'(\d+(?:\.\d+)?)\s*m\b(?!\s*/)', self.p.raw)
+        if self.p.h_target is not None:          # given explicitly (e.g. by Claude)
+            self.h_target = self.p.h_target
+        elif len(nums) >= 2:
+            self.h0 = float(nums[0])
+            self.h_target = float(nums[1])
+        elif len(nums) == 1:
+            self.h0 = float(nums[0])
+            self.h_target = 0.0   # only one height given: measure to the valley floor
+
+        self.g = self.p.g
+        self.u = self.p.speed or 0.0
+        v_sq = self.u**2 + 2 * self.g * (self.h0 - self.h_target)
+        self.v_target = math.sqrt(max(v_sq, 0.0))   # 0 ⇒ it can't reach the target height
+        self.exit_speed = self.v_target
+
+        self.results = [
+            f'Mass: {self.m:g} kg',
+            f'Start height (peak 1): {self.h0:g} m',
+            f'Target height (peak 2): {self.h_target:g} m',
+            f'Speed at second peak: {self.v_target:.2f} m/s ({self.v_target*3.6:.1f} km/h)',
+            f'Initial Energy (E_p1): {self.m * self.g * self.h0:,.2f} J',
+            f'Potential Energy at peak 2: {self.m * self.g * self.h_target:,.2f} J'
+        ]
+        self.equations = [
+            'E_initial = E_final  ⇒  ½mu² + mgh₁ = ½mv² + mgh₂',
+            f'v = √[u² + 2g(h₁ − h₂)] = √[{self.u:g}² + 2 · {self.g:g} · ({self.h0:g} − {self.h_target:g})] = {self.v_target:.2f} m/s'
+        ]
+        self.total_time = 3.5
+        self.progress = 0.0
+
+    def step(self):
+        if self.finished:
+            return False
+        self.t += self.dt
+        self.progress = min(self.t / self.total_time, 1.0)
+        if self.progress >= 1.0:
+            self.finished = True
+        return not self.finished
+
+    def state(self):
+        return {
+            'h0': self.h0,
+            'h_target': self.h_target,
+            'progress': self.progress,
+            'v_target': self.v_target
+        }
+
+
+class CircularSim(BaseSim):
+    def _setup(self):
+        self.r = self.p.radius or 2.0
+        self.v = self.p.speed or self.p.velocity or 5.0
+        self.omega = self.v / self.r if self.r > 0 else 1.0
+        self.m = self.p.mass or 1.0
+        self.ac = (self.v**2) / self.r if self.r > 0 else 0.0
+        self.fc = self.m * self.ac
+        self.exit_speed = self.v
+        self.period = 2 * math.pi * self.r / self.v if self.v > 0 else 0.0
+        self.theta = 0.0
+        self.results = [
+            f'Radius: {self.r:g} m',
+            f'Speed: {self.v:g} m/s',
+            f'Angular velocity (ω): {self.omega:.2f} rad/s',
+            f'Centripetal acceleration: {self.ac:.2f} m/s²',
+            f'Centripetal force: {self.fc:.2f} N',
+            f'Period: {self.period:.2f} s'
+        ]
+        self.equations = [
+            f'a_c = v²/r = {self.ac:.2f} m/s²',
+            f'F_c = m·v²/r = {self.fc:.2f} N'
+        ]
+
+    def step(self):
+        self.theta += self.omega * self.dt
+        self.t += self.dt
+        return True
+
+    def state(self):
+        return {'theta': self.theta, 'r': self.r, 'v': self.v, 'ac': self.ac}
+
+
+class CollisionSim(BaseSim):
+    def _setup(self):
+        masses = [float(x) for x in re.findall(r'(\d+(?:\.\d+)?)\s*kg\b', self.p.raw)]
+        speeds = [float(x) for x in re.findall(r'(\d+(?:\.\d+)?)\s*m\s*/\s*s', self.p.raw)]
+        self.m1 = self.p.mass or (masses[0] if masses else 2.0)
+        self.m2 = self.p.mass2 or (masses[1] if len(masses) > 1 else 1.5)
+        self.u1 = self.p.speed or (speeds[0] if speeds else 4.0)
+        self.u2 = -abs(self.p.speed2 if self.p.speed2 is not None
+                       else (speeds[1] if len(speeds) > 1 else 2.0)) or 0.0   # body 2 moves toward body 1
+        self.v1f = ((self.m1 - self.m2) * self.u1 + 2 * self.m2 * self.u2) / (self.m1 + self.m2)
+        self.v2f = ((self.m2 - self.m1) * self.u2 + 2 * self.m1 * self.u1) / (self.m1 + self.m2)
+        self.exit_speed = abs(self.v2f)   # the body that was hit moves on
+        self.carried_mass = self.m2
+        
+        self.x1_start = -3.0
+        self.x2_start = 3.0
+        self.x1 = self.x1_start
+        self.x2 = self.x2_start
+        self.collided = False
+        closing = self.u1 - self.u2
+        self.collision_time = (self.x2_start - self.x1_start) / closing if closing > 0 else float('inf')
+        self.x_meet = self.x1_start + self.u1 * self.collision_time if closing > 0 else 0.0
+        
+        p_initial = self.m1 * self.u1 + self.m2 * self.u2
+        p_final = self.m1 * self.v1f + self.m2 * self.v2f
+        
+        self.results = [
+            f'Body 1: m₁ = {self.m1:g} kg, u₁ = {self.u1:.3g} m/s',
+            f'Body 2: m₂ = {self.m2:g} kg, u₂ = {self.u2:.3g} m/s',
+            f'Final velocity v₁f: {self.v1f:.2f} m/s',
+            f'Final velocity v₂f: {self.v2f:.2f} m/s',
+            f'Total initial momentum: {p_initial:.2f} kg·m/s',
+            f'Total final momentum: {p_final:.2f} kg·m/s'
+        ]
+        self.equations = [
+            'p_initial = p_final (Conservation of Momentum)',
+            f'v₁f = {self.v1f:.2f} m/s, v₂f = {self.v2f:.2f} m/s'
+        ]
+
+    def step(self):
+        if self.t < self.collision_time:
+            self.x1 = self.x1_start + self.u1 * self.t
+            self.x2 = self.x2_start + self.u2 * self.t
+        else:
+            if not self.collided:
+                self.collided = True
+            dt_after = self.t - self.collision_time
+            self.x1 = self.x_meet + self.v1f * dt_after
+            self.x2 = self.x_meet + self.v2f * dt_after
+
+        self.t += self.dt
+        after = 3.0 if self.p.chain == 'solo' else 1.0   # in a chain, hand over soon after impact
+        if self.t > min(self.collision_time, 10.0) + after:
+            self.finished = True
+            return False
+        return True
+
+    def state(self):
+        return {'x1': self.x1, 'x2': self.x2, 'm1': self.m1, 'm2': self.m2, 'collided': self.collided}
+
+
+class MotionSim(BaseSim):
+    def _setup(self):
+        self.v = self.p.speed or self.p.velocity or 5.0
+        self.x = 0.0
+        self.exit_speed = self.v
+        self.results = [f'Speed: {self.v:g} m/s']
+        if self.p.mass:
+            ke = 0.5 * self.p.mass * self.v**2
+            self.results.insert(0, f'Mass: {self.p.mass:g} kg')
+            self.results.append(f'Kinetic energy: {ke:,.2f} J')
+            self.equations = [f'Eₖ = ½mv² = {ke:,.2f} J']
+
+    def step(self):
+        self.x += self.v * self.dt
+        self.t += self.dt
+        if self.x > 100:
+            self.x = 0
+        return True
+
+    def state(self):
+        return {'x': self.x, 'v': self.v}
+
+
+def build_sim(parsed: ParsedProblem) -> BaseSim:
+    mapping = {
+        'freefall': FreeFallSim,
+        'projectile': ProjectileSim,
+        'spring': SpringSim,
+        'pendulum': PendulumSim,
+        'incline': InclineSim,
+        'track': TrackSim,
+        'circular': CircularSim,
+        'collision': CollisionSim,
+        'motion': MotionSim,
+    }
+    cls = mapping.get(parsed.model, MotionSim)
+    return cls(parsed)
+
+
+STAGE_MAX_TIME = 4.0   # seconds a never-ending stage (circular, motion…) runs inside a chain
+STAGE_MIN_SHOW = 1.5   # stages shorter than this (s) play in slow motion so they can be seen
+
+
+class CompoundSim(BaseSim):
+    """Runs several stages one after another. The exit speed and moving mass of each stage
+    become the starting speed and mass of the next."""
+    def __init__(self, stages: List[ParsedProblem]):
+        self.specs = stages
+        super().__init__(stages[0])
+
+    def _setup(self):
+        self.sims: List[BaseSim] = []
+        self.idx = 0
+        speed_in: Optional[float] = None
+        mass_in: Optional[float] = None
+        n = len(self.specs)
+        for i, spec in enumerate(self.specs):
+            p = copy.deepcopy(spec)
+            p.chain = 'first' if i == 0 else ('last' if i == n - 1 else 'middle')
+            if i > 0 and p.model == 'collision':
+                if p.mass2 is None:
+                    p.mass2 = spec.mass          # the body named in this stage is the one being hit
+                if mass_in is not None:
+                    p.mass = mass_in
+                if speed_in is not None:
+                    p.speed = speed_in
+                if p.speed2 is None:
+                    p.speed2 = 0.0
+            elif i > 0:
+                if p.mass is None:
+                    p.mass = mass_in
+                if speed_in is not None and p.speed is None:
+                    p.speed = p.velocity = speed_in
+                    if p.model == 'spring' and p.vmax is None:
+                        p.vmax = speed_in
+            sim = build_sim(p)
+            sim.slowmo = self._slow_motion(sim)
+            sim.dt /= sim.slowmo
+            self.sims.append(sim)
+            speed_in, mass_in = sim.exit_speed, sim.carried_mass
+
+        self.results, self.equations = [], []
+        for i, sim in enumerate(self.sims):
+            line = f'{i + 1}. {sim.p.model.upper()}: ' + ' • '.join(sim.results)
+            if i < n - 1:
+                line += f'  →  hands on {sim.exit_speed:.2f} m/s'
+            self.results.append(line)
+            self.equations.append(f'{i + 1}. ' + '   |   '.join(sim.equations))
+        self.exit_speed = self.sims[-1].exit_speed
+        self.carried_mass = self.sims[-1].carried_mass
+
+    @staticmethod
+    def _slow_motion(sim: BaseSim) -> float:
+        """How much to slow a stage down so it lasts at least STAGE_MIN_SHOW seconds on screen."""
+        trial = copy.deepcopy(sim)
+        while trial.step() and trial.t < STAGE_MAX_TIME:
+            pass
+        return max(1.0, STAGE_MIN_SHOW / max(trial.t, 1e-3))
+
+    def step(self):
+        if self.finished:
+            return False
+        sim = self.sims[self.idx]
+        running = sim.step()
+        self.t += self.dt
+        if not running or sim.t >= STAGE_MAX_TIME:
+            if self.idx < len(self.sims) - 1:
+                self.idx += 1
+            else:
+                self.finished = True
+        return not self.finished
+
+    def state(self):
+        return {'idx': self.idx}
+
+
+def build_problem(stages: List[ParsedProblem]) -> BaseSim:
+    stages = [p for p in stages if p.model != 'none']
+    return build_sim(stages[0]) if len(stages) == 1 else CompoundSim(stages)
+
+# ─── Main Application ────────────────────────────────────────────────────────
+class Physualize:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        root.title('Physualize v2 | Physics Visualization Engine')
+        root.geometry('1100x760')
+        root.minsize(720, 580)
+        root.configure(bg=BG)
+
+        self.g = 9.81
+        self.parser = OfflineParser(self.g)
+        self.sim: Optional[BaseSim] = None
+        self.animating = False
+        self.after_id = None
+        self.stages: List[ParsedProblem] = []
+        self.loaded_image = None
+        self.image_path: Optional[str] = None
+        self.canvas_thumb = None
+        self.vision = VisionInterpreter()
+        self.vision_jobs: 'queue.Queue' = queue.Queue()
+        self.busy = False
+
+        self._build_ui()
+        self.draw()
+
+    def _build_ui(self):
+        header = tk.Frame(self.root, bg=BG)
+        header.pack(fill='x', padx=18, pady=(14, 8))
+        tk.Label(header, text='PHYSUALIZE', bg=BG, fg=MINT, font=('Arial', 22, 'bold')).pack(anchor='w')
+        tk.Label(header, text='Offline physics engine • Type any problem • Watch it simulate',
+                 bg=BG, fg=MUTED).pack(anchor='w')
+
+        self.status = tk.Label(self.root, text='READY | Type a problem (and optionally attach a diagram), then visualize',
+                               bg='#070d17', fg=MUTED, anchor='w', padx=12, pady=6)
+        self.status.pack(fill='x', side='bottom')
+
+        main = tk.Frame(self.root, bg=BG)
+        main.pack(fill='both', expand=True, padx=12, pady=4)
+
+        # Left panel
+        left = tk.Frame(main, bg=PANEL, padx=12, pady=12)
+        left.pack(side='left', fill='y', padx=(0, 10))
+
+        tk.Label(left, text='YOUR PHYSICS PROBLEM', bg=PANEL, fg=TEXT,
+                 font=('Arial', 10, 'bold')).pack(anchor='w')
+        self.problem = tk.Text(left, width=36, height=7, wrap='word', bg='#091426', fg=TEXT,
+                               insertbackground=TEXT, relief='flat', padx=8, pady=8, font=('Arial', 10))
+        self.problem.pack(fill='x', pady=4)
+        self.problem.insert('1.0',
+            'A snowboarder with a mass of 57 kg starts from rest at a height of 45 m and follows a frictionless path to a second peak at 25 m.')
+
+        # Image Upload Section
+        img_row = tk.Frame(left, bg=PANEL)
+        img_row.pack(fill='x', pady=4)
+        tk.Button(img_row, text='Upload Diagram (PNG/GIF)', command=self.upload_image,
+                  bg=ACCENT, fg=TEXT, relief='flat').pack(side='left', fill='x', expand=True, padx=(0, 2))
+        tk.Button(img_row, text='Clear', command=self.clear_image,
+                  bg=ACCENT, fg=TEXT, relief='flat').pack(side='left', fill='x', expand=True, padx=(2, 0))
+
+        self.img_preview_label = tk.Label(left, text='No diagram attached', bg='#091426', fg=MUTED,
+                                          font=('Arial', 9), height=4, relief='flat')
+        self.img_preview_label.pack(fill='x', pady=(0, 2))
+        reader = tk.Frame(left, bg=PANEL)
+        reader.pack(fill='x', pady=(0, 6))
+        tk.Label(reader, text='DIAGRAM READER', bg=PANEL, fg=MUTED,
+                 font=('Arial', 9, 'bold')).grid(row=0, column=0, sticky='w')
+        self.engine_label = tk.StringVar(value=ENGINES['ollama'])
+        menu = tk.OptionMenu(reader, self.engine_label, *ENGINES.values())
+        menu.config(bg=ACCENT, fg=TEXT, activebackground=ACCENT, activeforeground=TEXT,
+                    relief='flat', highlightthickness=0, anchor='w')
+        menu['menu'].config(bg=PANEL, fg=TEXT)
+        menu.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(2, 2))
+        tk.Label(reader, text='Local model', bg=PANEL, fg=MUTED,
+                 font=('Arial', 9)).grid(row=2, column=0, sticky='w')
+        self.ollama_model = tk.StringVar(value=OLLAMA_DEFAULT_MODEL)
+        tk.Entry(reader, textvariable=self.ollama_model, bg='#091426', fg=TEXT, insertbackground=TEXT,
+                 relief='flat', width=18).grid(row=2, column=1, sticky='ew', padx=(6, 0), ipady=2)
+        reader.columnconfigure(1, weight=1)
+
+        tk.Label(left, text='GRAVITY (m/s²)', bg=PANEL, fg=MUTED,
+                 font=('Arial', 9, 'bold')).pack(anchor='w', pady=(2, 2))
+        self.gravity = tk.StringVar(value='9.81')
+        tk.Entry(left, textvariable=self.gravity, bg='#091426', fg=TEXT,
+                 insertbackground=TEXT, relief='flat').pack(fill='x', ipady=4, pady=(0, 6))
+
+        self.visualize_btn = tk.Button(left, text='VISUALIZE PROBLEM', command=self.solve,
+                                       bg=MINT, fg='#081522', relief='flat',
+                                       font=('Arial', 10, 'bold'), pady=8)
+        self.visualize_btn.pack(fill='x')
+
+        row = tk.Frame(left, bg=PANEL)
+        row.pack(fill='x', pady=6)
+        tk.Button(row, text='Reset', command=self.clear, bg=ACCENT, fg=TEXT,
+                  relief='flat').pack(side='left', fill='x', expand=True, padx=(0, 4))
+        tk.Button(row, text='Examples ▼', command=self.show_examples, bg=ACCENT, fg=TEXT,
+                  relief='flat').pack(side='left', fill='x', expand=True, padx=(4, 0))
+
+        tk.Label(left, text='SUPPORTED MODELS', bg=PANEL, fg=BLUE,
+                 font=('Arial', 9, 'bold')).pack(anchor='w', pady=(8, 2))
+        models_txt = (
+            '• Snowboarder / Valley Track\n'
+            '• Free fall / Projectile\n'
+            '• Spring / Pendulum / Incline\n'
+            '• Circular motion / Collisions'
+        )
+        tk.Label(left, text=models_txt, bg=PANEL, fg=MUTED, justify='left',
+                 wraplength=260).pack(anchor='w')
+
+        # Right side
+        right = tk.Frame(main, bg=BG)
+        right.pack(side='left', fill='both', expand=True)
+
+        self.canvas = tk.Canvas(right, bg=CANVAS, highlightthickness=0)
+        self.canvas.pack(fill='both', expand=True)
+        self.canvas.bind('<Configure>', lambda e: self.draw())
+
+        controls = tk.Frame(right, bg=BG)
+        controls.pack(fill='x', pady=6)
+        tk.Button(controls, text='▶ Play / Replay', command=self.play,
+                  bg=ACCENT, fg=TEXT, relief='flat', padx=10).pack(side='left', padx=(0, 6))
+        tk.Button(controls, text='■ Stop', command=self.stop,
+                  bg=ACCENT, fg=TEXT, relief='flat', padx=10).pack(side='left')
+
+        results = tk.Frame(right, bg=PANEL, padx=12, pady=10)
+        results.pack(fill='x')
+        tk.Label(results, text='PHYSICS RESULTS', bg=PANEL, fg=TEXT,
+                 font=('Arial', 11, 'bold')).pack(anchor='w')
+        self.result = tk.Label(results, text='Enter a problem and click Visualize.',
+                               bg=PANEL, fg=MINT, justify='left', anchor='w',
+                               font=('Consolas', 10), wraplength=650)
+        self.result.pack(fill='x', pady=(6, 2))
+        self.equation = tk.Label(results, text='', bg=PANEL, fg=MUTED,
+                                 justify='left', anchor='w', wraplength=650)
+        self.equation.pack(fill='x')
+
+    # ─── Actions ─────────────────────────────────────────────────────────────
+    def upload_image(self):
+        file_path = filedialog.askopenfilename(
+            title='Select Physics Problem Image (PNG or GIF)',
+            filetypes=[('PNG / GIF Images', '*.png *.gif'), ('All Files', '*.*')]
+        )
+        if not file_path:
+            return
+        try:
+            img = tk.PhotoImage(file=file_path)
+            factor = max(1, math.ceil(img.width() / 260), math.ceil(img.height() / 160))
+            self.loaded_image = img.subsample(factor) if factor > 1 else img
+            thumb = max(1, math.ceil(img.width() / 150), math.ceil(img.height() / 110))
+            self.canvas_thumb = img.subsample(thumb) if thumb > 1 else img
+            self.image_path = file_path
+            self.img_preview_label.config(image=self.loaded_image, text='', height=self.loaded_image.height())
+            self.draw()
+            self.status.config(text=f'Diagram loaded: {os.path.basename(file_path)}')
+        except Exception as e:
+            messagebox.showerror('Image Error', f'Could not load image. Ensure it is a PNG or GIF file.\n\nError: {e}')
+
+    def clear_image(self):
+        self.loaded_image = None
+        self.canvas_thumb = None
+        self.image_path = None
+        self.img_preview_label.config(image='', text='No diagram attached', height=4)
+        self.draw()
+        self.status.config(text='Image cleared.')
+
+    def clear(self):
+        self.stop()
+        self.problem.delete('1.0', 'end')
+        self.result.config(text='Type a problem, then click Visualize.')
+        self.equation.config(text='')
+        self.sim = None
+        self.stages = []
+        self.draw()
+        self.status.config(text='READY | Enter a new problem.')
+        self.problem.focus_set()
+
+    def show_examples(self):
+        examples = [
+            'A snowboarder with a mass of 57 kg starts from rest at a height of 45 m and follows a frictionless path to a second peak at 25 m.',
+            'A ball is launched at 25 m/s at an angle of 40 degrees.',
+            'A 2 kg ball falls from a height of 15 m.',
+            'A 0.5 kg mass on a spring is compressed 0.25 m and released. Maximum speed is 1.5 m/s.',
+            'A pendulum of length 1.2 m is released from 25 degrees.',
+            'A body moves in uniform circular motion with radius 3 m at a speed of 6 m/s.',
+            'A 2 kg mass collides elastically with another body moving in opposite direction.',
+            'A 0.5 kg block is pressed against a spring with k = 200 N/m, compressing it 0.1 m. When released, it slides up a 30° frictionless ramp.',
+            'A 2 kg ball falls from a height of 5 m and lands on a spring with k = 400 N/m.',
+            'A 1 kg pendulum bob on a 2 m string is released from 40 degrees and hits a 1 kg block at the bottom, which then slides up a 20° ramp with friction coefficient 0.1.',
+        ]
+        menu = tk.Menu(self.root, tearoff=0, bg=PANEL, fg=TEXT)
+        for ex in examples:
+            menu.add_command(label=ex[:60] + ('…' if len(ex) > 60 else ''),
+                             command=lambda e=ex: self._load_example(e))
+        try:
+            menu.tk_popup(self.root.winfo_pointerx(), self.root.winfo_pointery())
+        finally:
+            menu.grab_release()
+
+    def _load_example(self, text: str):
+        self.problem.delete('1.0', 'end')
+        self.problem.insert('1.0', text)
+        self.solve()
+
+    def solve(self):
+        if self.busy:
+            return
+        self.stop()
+        text = self.problem.get('1.0', 'end').strip()
+        engine = self._engine()
+        use_vision = self.image_path is not None and engine != 'off'
+        if not text and not use_vision:
+            messagebox.showinfo('Physualize', 'Please type a physics problem or attach a diagram first.')
+            return
+        try:
+            g = float(self.gravity.get())
+            if not math.isfinite(g) or g <= 0:
+                raise ValueError
+            self.g = g
+        except ValueError:
+            messagebox.showerror('Invalid gravity', 'Enter a positive number, e.g. 9.81')
+            return
+
+        self.parser = OfflineParser(self.g)
+        if use_vision:
+            self._start_vision(self.image_path, text)
+        else:
+            self._show_parsed(self.parser.parse_problem(text), 'Offline simulation ready')
+
+    def _engine(self) -> str:
+        return next(k for k, label in ENGINES.items() if label == self.engine_label.get())
+
+    def _start_vision(self, image_path: str, text: str):
+        engine = self._engine()
+        model = self.ollama_model.get().strip()
+        try:
+            data, media_type = load_image_bytes(image_path, engine)
+        except (VisionError, OSError, tk.TclError) as e:
+            self.vision_jobs.put(('error', str(e)))
+            self.busy = True
+            self._poll_vision(text)
+            return
+        self.busy = True
+        self.visualize_btn.config(state='disabled', text='READING DIAGRAM…')
+        self.status.config(text='Sending diagram to Claude…' if engine == 'claude' else
+                           'Local model is reading the diagram… (the first run loads the model and can take a minute)')
+        g = self.g
+
+        def work():   # runs off the UI thread: network only, no Tk calls
+            try:
+                self.vision_jobs.put(('ok', self.vision.interpret(data, media_type, text, g, engine, model)))
+            except VisionError as e:
+                self.vision_jobs.put(('error', str(e)))
+            except Exception as e:
+                self.vision_jobs.put(('error', f'Unexpected error: {e}'))
+
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(100, lambda: self._poll_vision(text))
+
+    def _poll_vision(self, text: str):
+        try:
+            kind, payload = self.vision_jobs.get_nowait()
+        except queue.Empty:
+            self.root.after(100, lambda: self._poll_vision(text))
+            return
+        self.busy = False
+        self.visualize_btn.config(state='normal', text='VISUALIZE PROBLEM')
+        offline = self.parser.parse_problem(text) if text else []
+        if kind == 'ok':
+            self._show_parsed(merge_stages(payload, offline), f'Diagram read by {self.vision.who}')
+        elif text:
+            messagebox.showwarning('Diagram reader unavailable', f'{payload}\n\nUsing the typed text only.')
+            self._show_parsed(offline, 'Offline simulation ready (diagram not used)')
+        else:
+            messagebox.showerror('Diagram reader unavailable', payload)
+            self.status.config(text='Diagram could not be interpreted.')
+
+    def _show_parsed(self, stages: List[ParsedProblem], source: str):
+        self.stages = [p for p in stages if p.model != 'none']
+        if not self.stages:
+            self.result.config(text='Could not recognize a supported model.\n'
+                                    'Try mentioning: snowboarder, peak, valley, fall, projectile, spring, circular…')
+            self.equation.config(text='')
+            self.sim = None
+            self.status.config(text='NEEDS A CLEARER PROBLEM')
+            self.draw()
+            return
+
+        self.sim = build_problem(self.stages)
+        self.result.config(text='\n'.join(self.sim.results))
+        notes = [f'Note: {n}' for p in self.stages for n in p.notes]
+        self.equation.config(text='\n'.join(self.sim.equations + notes))
+        models = ' → '.join(p.model.upper() for p in self.stages)
+        label = 'MODELS' if len(self.stages) > 1 else 'MODEL'
+        self.status.config(text=f'{label}: {models} | {source}')
+        self.draw()
+
+    def play(self):
+        if self.sim is None:
+            self.status.config(text='Visualize a problem first.')
+            return
+        self.stop()
+        self.sim.reset()
+        self.animating = True
+        self._animate()
+
+    def stop(self):
+        self.animating = False
+        if self.after_id is not None:
+            try:
+                self.root.after_cancel(self.after_id)
+            except tk.TclError:
+                pass
+            self.after_id = None
+        self.draw()
+
+    def _animate(self):
+        if not self.animating or self.sim is None:
+            return
+        running = self.sim.step()
+        self.draw()
+        if running:
+            self.after_id = self.root.after(16, self._animate)
+        else:
+            self.animating = False
+
+    # ─── Drawing ─────────────────────────────────────────────────────────────
+    def draw(self):
+        c = self.canvas
+        c.delete('all')
+        w = max(c.winfo_width(), 320)
+        h = max(c.winfo_height(), 260)
+        c.create_text(16, 14, text='SIMULATION', fill=MUTED, anchor='nw', font=('Arial', 10, 'bold'))
+
+        if self.sim is None:
+            c.create_text(w/2, h/2, text='Enter a physics problem (or attach a diagram)\nand click VISUALIZE PROBLEM',
+                          fill=TEXT, justify='center', font=('Arial', 13))
+        elif isinstance(self.sim, CompoundSim):
+            self._draw_compound(c, w, h)
+        else:
+            self._draw_model(c, self.sim, w, h)
+
+        if self.canvas_thumb is not None:
+            c.create_image(w - 10, 10, image=self.canvas_thumb, anchor='ne')
+            c.create_text(w - 10, 14 + self.canvas_thumb.height(), text='attached diagram',
+                          fill=MUTED, anchor='ne', font=('Arial', 8))
+
+    def _draw_model(self, c, sim: BaseSim, w, h):
+        draw = {
+            'freefall': self._draw_freefall, 'projectile': self._draw_projectile,
+            'spring': self._draw_spring, 'pendulum': self._draw_pendulum,
+            'incline': self._draw_incline, 'track': self._draw_track,
+            'circular': self._draw_circular, 'collision': self._draw_collision,
+        }.get(sim.p.model, self._draw_motion)
+        draw(c, w, h, sim.state())
+
+    def _draw_compound(self, c, w, h):
+        """Every stage in its own panel, all visible at once; the running stage is highlighted."""
+        sims = self.sim.sims
+        n = len(sims)
+        cols = n if n <= 3 else 2
+        rows = math.ceil(n / cols)
+        top = 30
+        pw, ph = w / cols, (h - top) / rows
+        for i, sim in enumerate(sims):
+            x0, y0 = (i % cols) * pw, top + (i // cols) * ph
+            last_id = (c.find_all() or (0,))[-1]
+            self._draw_model(c, sim, pw, ph)
+            for item in c.find_all():          # shift this panel's drawing into place
+                if item > last_id:
+                    c.move(item, x0, y0)
+            active = i == self.sim.idx
+            done = i < self.sim.idx
+            c.create_rectangle(x0 + 4, y0 + 4, x0 + pw - 4, y0 + ph - 4,
+                               outline=MINT if active else ACCENT, width=2 if active else 1)
+            label = f'{i + 1} · {sim.p.model.upper()}' + (' ✓' if done else '')
+            if i < n - 1:
+                label += f'   → {sim.exit_speed:.2f} m/s'
+            if getattr(sim, 'slowmo', 1.0) > 1.05:
+                label += f'   (slow-mo ×{sim.slowmo:.0f})'
+            c.create_text(x0 + 12, y0 + 10, text=label, anchor='nw',
+                          fill=MINT if active else MUTED, font=('Arial', 9, 'bold'))
+
+    def _draw_freefall(self, c, w, h, st):
+        top, bottom = h*0.15, h*0.85
+        cx = w*0.5
+        c.create_line(w*0.2, bottom, w*0.8, bottom, fill=BLUE, width=2)
+        c.create_text(w*0.5, bottom+18, text='GROUND', fill=MUTED)
+        y = top + (bottom-top) * (1 - st['y']/st['h0']) if st['h0'] else bottom
+        c.create_oval(cx-12, y-12, cx+12, y+12, fill=MINT, outline='')
+        c.create_text(cx, y-22, text=f"{st['y']:.1f} m", fill=TEXT)
+        c.create_text(w*0.5, h*0.93, text=f"Free fall • v = {st['v']:.1f} m/s", fill=TEXT)
+
+    def _draw_projectile(self, c, w, h, st):
+        margin = 40
+        scale_x = (w - 2*margin) / max(st['R'], 1)
+        scale_y = (h - 80) / max(st['H']*1.3, 1)
+        scale = min(scale_x, scale_y)
+        ox, oy = margin, h - 40
+        c.create_line(ox, oy, w-margin, oy, fill=BLUE, width=2)
+        pts = []
+        for i in range(40):
+            t = i / 39 * (st.get('t', 0) + 0.01)
+            x = st['ux'] * t
+            y = st['uy'] * t - 0.5 * st['g'] * t**2
+            if y < 0:
+                break
+            pts.extend([ox + x*scale, oy - y*scale])
+        if len(pts) >= 4:
+            c.create_line(*pts, fill='#3a5a7a', width=1, dash=(4, 4))
+        bx = ox + st['x'] * scale
+        by = oy - st['y'] * scale
+        c.create_oval(bx-9, by-9, bx+9, by+9, fill=MINT, outline='')
+        c.create_text(w*0.5, 28, text=f"Projectile  x={st['x']:.1f} m  y={st['y']:.1f} m", fill=TEXT)
+
+    def _draw_spring(self, c, w, h, st):
+        cy = h * 0.48
+        left = w * 0.12
+        amp_px = min(w*0.28, 120)
+        x = left + amp_px + 60 + (st['x'] / max(st['A'], 0.01)) * amp_px
+        c.create_line(left, cy-60, left, cy+60, fill=MUTED, width=5)
+        c.create_text(left, cy+78, text='WALL', fill=MUTED)
+        c.create_line(left, cy, w*0.88, cy, fill='#45617d', width=2)
+        sx, ex = left+6, x-16
+        pts = [sx, cy]
+        n = 14
+        for i in range(1, n):
+            pts.extend([sx + (ex-sx)*i/n, cy + (14 if i%2 else -14)])
+        pts.extend([ex, cy])
+        c.create_line(*pts, fill=BLUE, width=2)
+        c.create_rectangle(x-16, cy-16, x+16, cy+16, fill=MINT, outline='')
+        c.create_text(x, cy+36, text='MASS', fill=TEXT)
+        c.create_text(w*0.5, h*0.85, text=f"SHM  x = {st['x']:.3f} m", fill=TEXT)
+
+    def _draw_pendulum(self, c, w, h, st):
+        pivot_x, pivot_y = w*0.5, h*0.18
+        L_px = min(h*0.55, w*0.38, 220)
+        theta = st['theta']
+        bx = pivot_x + L_px * math.sin(theta)
+        by = pivot_y + L_px * math.cos(theta)
+        c.create_line(pivot_x, pivot_y, bx, by, fill=BLUE, width=3)
+        c.create_oval(pivot_x-5, pivot_y-5, pivot_x+5, pivot_y+5, fill=MUTED)
+        c.create_oval(bx-14, by-14, bx+14, by+14, fill=MINT, outline='')
+        c.create_text(w*0.5, h*0.9, text=f"Pendulum  θ = {math.degrees(theta):.1f}°", fill=TEXT)
+
+    def _draw_incline(self, c, w, h, st):
+        angle = st['angle']
+        L = st['L']
+        base = L * math.cos(angle)
+        height = st['h']
+        scale = min((w*0.7)/max(base, 1e-3), (h*0.6)/max(height, 1e-3))
+        ox, oy = w*0.15, h*0.8
+        top_x = ox + base * scale
+        top_y = oy - height * scale
+        c.create_polygon(ox, oy, top_x, top_y, top_x, oy, fill='#1e3a52', outline=BLUE, width=2)
+        s = st['s']
+        frac = s / L if L else 0
+        if st.get('up'):     # starts at the bottom, moves toward the top
+            bx = ox + frac * (top_x - ox)
+            by = oy + frac * (top_y - oy)
+        else:
+            bx = top_x - frac * (top_x - ox)
+            by = top_y - frac * (top_y - oy)
+        c.create_rectangle(bx-12, by-12, bx+12, by+12, fill=MINT, outline='')
+        c.create_text(w*0.5, h*0.92, text=f"Incline  s = {s:.2f} m  v = {st['v']:.2f} m/s", fill=TEXT)
+
+    def _draw_track(self, c, w, h, st):
+        margin = 60
+        track_w = w - 2 * margin
+        track_h = h - 120
+        ox, oy = margin, h - 65
+
+        steps = 100
+        pts = []
+        max_h = max(st['h0'], st['h_target'], 45.0)
+
+        for i in range(steps + 1):
+            frac = i / steps
+            x = ox + frac * track_w
+            track_height_val = st['h0'] * (1 - frac) + st['h_target'] * frac + math.sin(frac * math.pi) * (-st['h0'] * 0.55)
+            track_height_val = max(0, track_height_val)
+            y = oy - (track_height_val / max_h) * track_h
+            pts.extend([x, y])
+
+        if len(pts) >= 4:
+            c.create_polygon(ox, oy, *pts, ox + track_w, oy, fill='#142842', outline='')
+            c.create_line(*pts, fill=BLUE, width=3)
+
+        prog = st['progress']
+        idx = int(prog * steps)
+        idx = min(idx, steps)
+        bx = pts[idx * 2]
+        by = pts[idx * 2 + 1]
+
+        c.create_oval(bx-12, by-12, bx+12, by+12, fill=MINT, outline='')
+        c.create_text(bx, by-22, text="Snowboarder", fill=TEXT, font=('Arial', 9, 'bold'))
+        c.create_text(w*0.5, h*0.92, text=f"Conservation of Energy • Speed at 2nd peak: {st['v_target']:.2f} m/s", fill=TEXT)
+
+    def _draw_circular(self, c, w, h, st):
+        cx, cy = w * 0.5, h * 0.5
+        r_px = min(w, h) * 0.28
+        c.create_oval(cx - r_px, cy - r_px, cx + r_px, cy + r_px, outline=BLUE, width=2, dash=(3, 3))
+        c.create_oval(cx-4, cy-4, cx+4, cy+4, fill=MUTED)
+        
+        theta = st['theta']
+        bx = cx + r_px * math.cos(theta)
+        by = cy + r_px * math.sin(theta)
+        c.create_oval(bx-12, by-12, bx+12, by+12, fill=MINT, outline='')
+        
+        vx = -r_px * math.sin(theta) * 0.4
+        vy = r_px * math.cos(theta) * 0.4
+        c.create_line(bx, by, bx+vx, by+vy, fill=BLUE, arrow=tk.LAST, width=2)
+        c.create_text(w*0.5, h*0.88, text=f"Circular Motion  v = {st['v']:.1f} m/s  a_c = {st['ac']:.2f} m/s²", fill=TEXT)
+
+    def _draw_collision(self, c, w, h, st):
+        cy = h * 0.5
+        scale = min(w * 0.12, 55)
+        cx = w * 0.5
+        
+        x1 = min(max(cx + st['x1'] * scale, 24), w - 24)   # keep the blocks inside the view
+        x2 = min(max(cx + st['x2'] * scale, 24), w - 24)
+        
+        c.create_line(w*0.1, cy+25, w*0.9, cy+25, fill=BLUE, width=2)
+        
+        c.create_rectangle(x1-22, cy-22, x1+22, cy+22, fill=MINT, outline='')
+        c.create_text(x1, cy, text=f"m₁", fill='#081522', font=('Arial', 9, 'bold'))
+        c.create_text(x1, cy-32, text=f"{st['m1']}kg", fill=TEXT)
+        
+        c.create_rectangle(x2-22, cy-22, x2+22, cy+22, fill=BLUE, outline='')
+        c.create_text(x2, cy, text=f"m₂", fill='#081522', font=('Arial', 9, 'bold'))
+        c.create_text(x2, cy-32, text=f"{st['m2']}kg", fill=TEXT)
+        
+        status_text = "Collision / Momentum Conservation" if not st['collided'] else "Post-Collision Trajectory"
+        c.create_text(w*0.5, h*0.88, text=status_text, fill=TEXT)
+
+    def _draw_motion(self, c, w, h, st):
+        cy = h * 0.5
+        c.create_line(w*0.08, cy, w*0.92, cy, fill=BLUE, width=3)
+        x = w*0.1 + (st['x'] % 100) / 100 * w*0.75
+        c.create_oval(x-11, cy-11, x+11, cy+11, fill=MINT, outline='')
+        c.create_text(w*0.5, h*0.7, text=f"Motion  v = {st['v']:g} m/s", fill=TEXT)
+
+
+if __name__ == '__main__':
+    root = tk.Tk()
+    app = Physualize(root)
+    root.mainloop()
